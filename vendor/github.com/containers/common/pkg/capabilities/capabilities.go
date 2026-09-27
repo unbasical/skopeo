@@ -6,15 +6,22 @@ package capabilities
 //       changed significantly to fit the needs of libpod.
 
 import (
+	"errors"
+	"fmt"
+	"slices"
+	"sort"
 	"strings"
+	"sync"
 
-	"github.com/pkg/errors"
 	"github.com/syndtr/gocapability/capability"
 )
 
 var (
 	// Used internally and populated during init().
 	capabilityList []string
+
+	// Used internally and populated during init().
+	capsList []capability.Cap
 
 	// ErrUnknownCapability is thrown when an unknown capability is processed.
 	ErrUnknownCapability = errors.New("unknown capability")
@@ -24,9 +31,13 @@ var (
 	ContainerImageLabels = []string{"io.containers.capabilities"}
 )
 
-// All is a special value used to add/drop all known capababilities.
+// All is a special value used to add/drop all known capabilities.
 // Useful on the CLI for `--cap-add=all` etc.
 const All = "ALL"
+
+func getCapName(c capability.Cap) string {
+	return "CAP_" + strings.ToUpper(c.String())
+}
 
 func init() {
 	last := capability.CAP_LAST_CAP
@@ -38,18 +49,43 @@ func init() {
 		if cap > last {
 			continue
 		}
-		capabilityList = append(capabilityList, "CAP_"+strings.ToUpper(cap.String()))
+		capsList = append(capsList, cap)
+		capabilityList = append(capabilityList, getCapName(cap))
+		sort.Strings(capabilityList)
 	}
 }
 
-// stringInSlice determines if a string is in a string slice, returns bool
-func stringInSlice(s string, sl []string) bool {
-	for _, i := range sl {
-		if i == s {
-			return true
+var (
+	boundingSetOnce sync.Once
+	boundingSetRet  []string
+	boundingSetErr  error
+)
+
+// BoundingSet returns the capabilities in the current bounding set
+func BoundingSet() ([]string, error) {
+	boundingSetOnce.Do(func() {
+		currentCaps, err := capability.NewPid2(0)
+		if err != nil {
+			boundingSetErr = err
+			return
 		}
-	}
-	return false
+		err = currentCaps.Load()
+		if err != nil {
+			boundingSetErr = err
+			return
+		}
+		var r []string
+		for _, c := range capsList {
+			if !currentCaps.Get(capability.BOUNDING, c) {
+				continue
+			}
+			r = append(r, getCapName(c))
+		}
+		boundingSetRet = r
+		sort.Strings(boundingSetRet)
+		boundingSetErr = err
+	})
+	return boundingSetRet, boundingSetErr
 }
 
 // AllCapabilities returns all known capabilities.
@@ -60,8 +96,8 @@ func AllCapabilities() []string {
 // NormalizeCapabilities normalizes caps by adding a "CAP_" prefix (if not yet
 // present).
 func NormalizeCapabilities(caps []string) ([]string, error) {
-	normalized := make([]string, len(caps))
-	for i, c := range caps {
+	normalized := make([]string, 0, len(caps))
+	for _, c := range caps {
 		c = strings.ToUpper(c)
 		if c == All {
 			normalized = append(normalized, c)
@@ -70,33 +106,32 @@ func NormalizeCapabilities(caps []string) ([]string, error) {
 		if !strings.HasPrefix(c, "CAP_") {
 			c = "CAP_" + c
 		}
-		if !stringInSlice(c, capabilityList) {
-			return nil, errors.Wrapf(ErrUnknownCapability, "%q", c)
+		if !slices.Contains(capabilityList, c) {
+			return nil, fmt.Errorf("%q: %w", c, ErrUnknownCapability)
 		}
-		normalized[i] = c
+		normalized = append(normalized, c)
 	}
+	sort.Strings(normalized)
 	return normalized, nil
 }
 
 // ValidateCapabilities validates if caps only contains valid capabilities.
 func ValidateCapabilities(caps []string) error {
 	for _, c := range caps {
-		if !stringInSlice(c, capabilityList) {
-			return errors.Wrapf(ErrUnknownCapability, "%q", c)
+		if !slices.Contains(capabilityList, c) {
+			return fmt.Errorf("%q: %w", c, ErrUnknownCapability)
 		}
 	}
 	return nil
 }
 
-// MergeCapabilities computes a set of capabilities by adding capapbitilities
+// MergeCapabilities computes a set of capabilities by adding capabilities
 // to or dropping them from base.
 //
 // Note that:
 // "ALL" in capAdd adds returns known capabilities
 // "All" in capDrop returns only the capabilities specified in capAdd
 func MergeCapabilities(base, adds, drops []string) ([]string, error) {
-	var caps []string
-
 	// Normalize the base capabilities
 	base, err := NormalizeCapabilities(base)
 	if err != nil {
@@ -115,31 +150,39 @@ func MergeCapabilities(base, adds, drops []string) ([]string, error) {
 		return nil, err
 	}
 
-	if stringInSlice(All, capDrop) {
+	if slices.Contains(capDrop, All) {
+		if slices.Contains(capAdd, All) {
+			return nil, errors.New("adding all caps and removing all caps not allowed")
+		}
 		// "Drop" all capabilities; return what's in capAdd instead
+		sort.Strings(capAdd)
 		return capAdd, nil
 	}
 
-	if stringInSlice(All, capAdd) {
-		// "Add" all capabilities;
-		return capabilityList, nil
-	}
-
-	for _, add := range capAdd {
-		if stringInSlice(add, capDrop) {
-			return nil, errors.Errorf("capability %q cannot be dropped and added", add)
+	if slices.Contains(capAdd, All) {
+		base, err = BoundingSet()
+		if err != nil {
+			return nil, err
+		}
+		capAdd = []string{}
+	} else {
+		for _, add := range capAdd {
+			if slices.Contains(capDrop, add) {
+				return nil, fmt.Errorf("capability %q cannot be dropped and added", add)
+			}
 		}
 	}
 
 	for _, drop := range capDrop {
-		if stringInSlice(drop, capAdd) {
-			return nil, errors.Errorf("capability %q cannot be dropped and added", drop)
+		if slices.Contains(capAdd, drop) {
+			return nil, fmt.Errorf("capability %q cannot be dropped and added", drop)
 		}
 	}
 
+	caps := make([]string, 0, len(base)+len(capAdd))
 	// Drop any capabilities in capDrop that are in base
 	for _, cap := range base {
-		if stringInSlice(cap, capDrop) {
+		if slices.Contains(capDrop, cap) {
 			continue
 		}
 		caps = append(caps, cap)
@@ -147,10 +190,11 @@ func MergeCapabilities(base, adds, drops []string) ([]string, error) {
 
 	// Add any capabilities in capAdd that are not in base
 	for _, cap := range capAdd {
-		if stringInSlice(cap, base) {
+		if slices.Contains(base, cap) {
 			continue
 		}
 		caps = append(caps, cap)
 	}
+	sort.Strings(caps)
 	return caps, nil
 }
